@@ -1,0 +1,430 @@
+---1.RETENTION
+WITH
+  F_M AS ( SELECT
+    user_id,
+    SUM(sale_price) AS monetary,
+    MAX(CAST(created_at AS DATE)) last_sale,
+    COUNT(order_id) AS frequency
+  FROM
+    `bigquery-public-data.thelook_ecommerce.order_items` AS items
+  WHERE
+    created_at BETWEEN '2019-01-01 00:00:00 UTC'
+    AND '2022-12-31 23:59:59 UTC'
+  GROUP BY
+    user_id),
+  --RECENCY 
+  recency_t AS  (SELECT
+  user_id,
+  DATE_DIFF('2022-12-31', MAX(last_sale), day) recency
+FROM
+  F_M
+GROUP BY
+  user_id),
+  --JOIN   RECENCY,  FREQUENCY,  MONETARY 
+  full_t AS (  SELECT
+    f_M.user_id,
+    recency,
+    frequency,
+    monetary
+  FROM
+    F_M
+  JOIN
+    recency_t
+  ON
+    F_M.user_id = recency_t.user_id),
+  --PROCENTILES 
+  percentiles AS   (SELECT   a.*,
+  b.percentiles[
+OFFSET  (20)] AS m20,  b.percentiles[
+OFFSET  (40)] AS m40,  b.percentiles[
+OFFSET  (60)] AS m60,  b.percentiles[
+OFFSET  (80)] AS m80,  b.percentiles[
+OFFSET  (100)] AS m100,  c.percentiles[
+OFFSET  (20)] AS f20,  c.percentiles[
+OFFSET  (40)] AS f40,  c.percentiles[
+OFFSET  (60)] AS f60,  c.percentiles[
+OFFSET  (80)] AS f80,  c.percentiles[
+OFFSET  (100)] AS f100,  d.percentiles[
+OFFSET  (20)] AS r20,  d.percentiles[
+OFFSET  (40)] AS r40,  d.percentiles[
+OFFSET  (60)] AS r60,  d.percentiles[
+OFFSET  (80)] AS r80,  d.percentiles[
+OFFSET  (100)] AS r100
+FROM  full_t a,  (
+  SELECT
+    APPROX_QUANTILES(monetary, 100) percentiles
+  FROM   full_t) b,
+  (
+  SELECT
+    APPROX_QUANTILES(frequency, 100) percentiles
+  FROM  full_t) c,
+  (  SELECT
+    APPROX_QUANTILES(recency, 100) percentiles
+  FROM
+    full_t) d ),
+  --SCORE CALCULATION 
+  score AS (SELECT  *,
+FROM (  SELECT *,
+    CAST(ROUND((f_score + m_score) / 2, 0) AS INT64) AS fm_score
+  FROM (
+    SELECT
+      *,
+      CASE
+        WHEN monetary <= m20 THEN 1
+        WHEN monetary <= m40 AND monetary > m20 THEN 2
+        WHEN monetary <= m60 AND monetary > m40 THEN 3
+        WHEN monetary <= m80 AND monetary > m60 THEN 4
+        WHEN monetary <= m100 AND monetary > m80 THEN 5
+    END
+      AS m_score,
+      CASE
+        WHEN frequency <= f20 THEN 1
+        WHEN frequency <= f40 AND frequency > f20 THEN 2
+        WHEN frequency <= f60 AND frequency > f40 THEN 3
+        WHEN frequency <= f80 AND frequency > f60 THEN 4
+        WHEN frequency <= f100 AND frequency > f80 THEN 5
+    END
+      AS f_score,
+      CASE
+        WHEN recency <= r20 THEN 5
+        WHEN recency <= r40 AND recency > r20 THEN 4
+        WHEN recency <= r60 AND recency > r40 THEN 3
+        WHEN recency <= r80 AND recency > r60 THEN 2
+        WHEN recency <= r100 AND recency > r80 THEN 1
+    END
+      AS r_score,
+    FROM
+      percentiles))),
+  -- DEFINE RFM SEGMENTS 
+  segments AS (
+SELECT
+  user_id,
+  recency,
+  frequency,
+  monetary,
+  r_score,
+  f_score,
+  m_score,
+  fm_score,
+  CASE
+    WHEN (r_score = 5 AND fm_score = 5) 
+    OR (r_score = 5 AND fm_score = 4) 
+    OR (r_score = 4 AND fm_score = 5) 
+    THEN 'Best customers'
+    WHEN (r_score = 5 AND fm_score =3)
+    OR (r_score = 4  AND fm_score = 4)
+    OR (r_score = 3 AND fm_score = 5)
+    OR (r_score = 3 AND fm_score = 4)
+    OR (r_score = 3 AND fm_score = 3) 
+    THEN 'Loyal Customers'
+    WHEN (r_score = 5 AND fm_score = 2) 
+    OR (r_score = 2 AND fm_score = 5) 
+    OR (r_score = 2 AND fm_score = 4) 
+    OR (r_score = 4 AND fm_score = 3) 
+    OR (r_score = 5 AND fm_score = 1 ) 
+    THEN 'Potential '
+    WHEN (r_score = 4 AND fm_score = 1)
+    OR (r_score = 3 AND fm_score = 1)
+    OR (r_score = 2 AND fm_score = 3)
+    OR (r_score = 4 AND fm_score = 2)
+    OR (r_score = 3 AND fm_score = 2) 
+    OR(r_score = 1 AND fm_score = 5) 
+    OR(r_score = 1 AND fm_score = 4) 
+    THEN 'Need attention'
+    WHEN (r_score = 2 AND fm_score = 1 ) 
+    OR (r_score = 2 AND fm_score = 2) 
+    OR (r_score = 1 AND fm_score = 3) 
+    OR r_score = 1 AND fm_score = 2 
+    OR r_score = 1 AND fm_score = 1 
+    THEN 'Lost'
+END
+  AS rfm_segment
+FROM
+  score),
+  RFM AS (  SELECT
+    rfm_segment,
+    last_sale AS order_date,
+    F_M.user_id AS user_id,
+    F_M.monetary,
+    recency,
+    F_M.frequency
+  FROM
+    F_M
+  JOIN  segments
+  ON F_M.user_id = segments.user_id),
+  users AS ( SELECT
+    DATE(DATE_TRUNC(items1.created_at, month)) AS order_date,
+    items1.product_id AS product_id,
+    items1.order_id AS order_id,
+    items1.user_id,
+    product_category,
+    product_name,
+    product_brand,
+    cost,
+    sale_price,
+    status,
+    (sale_price - cost ) AS profit,
+  FROM `bigquery-public-data.thelook_ecommerce.order_items` AS items1
+  LEFT JOIN `bigquery-public-data.thelook_ecommerce.inventory_items` AS inventory
+  ON  items1.product_id = inventory.product_id
+  WHERE items1.created_at BETWEEN '2019-01-01 00:00:00 UTC' AND '2022-12-31 23:59:59 UTC'
+  GROUP BY  2, 3, 1, 4, 5, 6, 7,8,9,10),
+  --final output 
+  final_table AS (SELECT
+  users.order_date AS order_date,
+  product_id,
+  order_id,
+  users.user_id AS user_id,
+  product_category,
+  product_name,
+  product_brand,
+  status,
+  cost,
+  sale_price,
+  profit,
+  rfm_segment,
+FROM  users
+LEFT JOIN  RFM
+ON  users.user_id = RFM.user_id),
+  tot_users AS ( SELECT
+    user_id,
+    order_id
+  FROM `bigquery-public-data.thelook_ecommerce.order_items`
+  WHERE created_at BETWEEN '2019-01-01 00:00:00 UTC'  AND '2022-12-31 23:59:59 UTC'
+     GROUP BY
+    order_id, user_id),
+    --adding additional column table
+  user_retention AS (
+  SELECT
+    DISTINCT user_id,
+    CASE
+      WHEN COUNT(1) >1 THEN 'return'
+    ELSE
+    'unic'
+  END
+    AS retention
+  FROM
+    tot_users
+  GROUP BY
+    user_id ),
+  return_user_output AS (
+  SELECT
+    user_retention.user_id,
+    retention,
+    order_date,
+    product_id,
+    order_id,
+    product_category,
+    product_name,
+    product_brand,
+    status,
+    cost,
+    sale_price,
+    profit,
+    rfm_segment
+  FROM
+    user_retention
+  LEFT JOIN
+    final_table
+  ON
+    user_retention.user_id = final_table.user_id)
+SELECT
+  *
+FROM
+  return_user_output
+
+  ---2.PARETO
+WITH
+  category_sales AS (
+  SELECT
+    product_category,
+    SUM(sale_price) AS revenue
+  FROM
+    `bigquery-public-data.thelook_ecommerce.inventory_items` items
+  INNER JOIN
+    `bigquery-public-data.thelook_ecommerce.order_items` products
+  ON
+    items.product_id = products.product_id
+  WHERE
+    items.created_at BETWEEN '2019-01-01 00:00:00 UTC'
+    AND '2022-12-31 23:59:59 UTC'
+  GROUP BY
+    1
+  ORDER BY
+    revenue DESC )
+SELECT
+  product_category,
+  revenue,
+  running_total,
+  total,
+  running_total / total AS percent_of_total
+FROM (
+  SELECT
+    product_category,
+    revenue,
+    SUM(revenue) OVER (ORDER BY revenue DESC) AS running_total,
+    SUM(revenue) OVER() AS total
+  FROM
+    category_sales)
+ORDER BY
+  revenue DESC;
+
+ --3.RFM
+WITH
+  F_M AS (
+  SELECT
+    user_id,
+    SUM(sale_price) AS monetary,
+    MAX(CAST(created_at AS DATE)) last_sale,
+    COUNT(order_id) AS frequency
+  FROM
+    `bigquery-public-data.thelook_ecommerce.order_items` AS items
+  WHERE
+    created_at BETWEEN '2019-01-01 00:00:00 UTC'
+    AND '2022-12-31 23:59:59 UTC'
+  GROUP BY
+    user_id),
+  --RECENCY 
+  recency_t AS 
+  (SELECT
+  user_id,
+  DATE_DIFF('2022-12-31', MAX(last_sale), day) recency
+FROM
+  F_M
+GROUP BY
+  user_id),
+  --JOIN   RECENCY,  FREQUENCY,  MONETARY 
+  full_t AS (
+  SELECT
+    f_M.user_id,
+    recency,
+    frequency,
+    monetary
+  FROM
+    F_M
+  JOIN
+    recency_t
+  ON
+    F_M.user_id = recency_t.user_id),
+ --PERCENTILES 
+  percentiles AS   (SELECT   a.*,
+  b.percentiles[
+OFFSET  (20)] AS m20,  b.percentiles[
+OFFSET  (40)] AS m40,  b.percentiles[
+OFFSET  (60)] AS m60,  b.percentiles[
+OFFSET  (80)] AS m80,  b.percentiles[
+OFFSET  (100)] AS m100,  c.percentiles[
+OFFSET  (20)] AS f20,  c.percentiles[
+OFFSET  (40)] AS f40,  c.percentiles[
+OFFSET  (60)] AS f60,  c.percentiles[
+OFFSET  (80)] AS f80,  c.percentiles[
+OFFSET  (100)] AS f100,  d.percentiles[
+OFFSET  (20)] AS r20,  d.percentiles[
+OFFSET  (40)] AS r40,  d.percentiles[
+OFFSET  (60)] AS r60,  d.percentiles[
+OFFSET  (80)] AS r80,  d.percentiles[
+OFFSET  (100)] AS r100
+FROM  full_t a,  (
+  SELECT
+    APPROX_QUANTILES(monetary, 100) percentiles
+  FROM   full_t) b,
+  (
+  SELECT
+    APPROX_QUANTILES(frequency, 100) percentiles
+  FROM  full_t) c,
+  (  SELECT
+    APPROX_QUANTILES(recency, 100) percentiles
+  FROM
+    full_t) d ),
+  --SCORE CALCULATION 
+  score AS (SELECT  *,
+FROM (  SELECT *,
+    CAST(ROUND((f_score + m_score) / 2, 0) AS INT64) AS fm_score
+  FROM (
+    SELECT
+      *,
+      CASE
+        WHEN monetary <= m20 THEN 1
+        WHEN monetary <= m40 AND monetary > m20 THEN 2
+        WHEN monetary <= m60 AND monetary > m40 THEN 3
+        WHEN monetary <= m80 AND monetary > m60 THEN 4
+        WHEN monetary <= m100 AND monetary > m80 THEN 5
+    END
+      AS m_score,
+      CASE
+        WHEN frequency <= f20 THEN 1
+        WHEN frequency <= f40 AND frequency > f20 THEN 2
+        WHEN frequency <= f60 AND frequency > f40 THEN 3
+        WHEN frequency <= f80 AND frequency > f60 THEN 4
+        WHEN frequency <= f100 AND frequency > f80 THEN 5
+    END
+      AS f_score,
+      CASE
+        WHEN recency <= r20 THEN 5
+        WHEN recency <= r40 AND recency > r20 THEN 4
+        WHEN recency <= r60 AND recency > r40 THEN 3
+        WHEN recency <= r80 AND recency > r60 THEN 2
+        WHEN recency <= r100 AND recency > r80 THEN 1
+    END
+      AS r_score,
+    FROM
+      percentiles))),
+  -- DEFINE RFM SEGMENTS 
+  segments AS (
+SELECT
+  user_id,
+  recency,
+  frequency,
+  monetary,
+  r_score,
+  f_score,
+  m_score,
+  fm_score,
+  CASE
+    WHEN (r_score = 5 AND fm_score = 5) 
+    OR (r_score = 5 AND fm_score = 4) 
+    OR (r_score = 4 AND fm_score = 5) 
+    THEN 'Best customers'
+    WHEN (r_score = 5 AND fm_score =3)
+    OR (r_score = 4  AND fm_score = 4)
+    OR (r_score = 3 AND fm_score = 5)
+    OR (r_score = 3 AND fm_score = 4)
+    OR (r_score = 3 AND fm_score = 3) 
+    THEN 'Loyal Customers'
+    WHEN (r_score = 5 AND fm_score = 2) 
+    OR (r_score = 2 AND fm_score = 5) 
+    OR (r_score = 2 AND fm_score = 4) 
+    OR (r_score = 4 AND fm_score = 3) 
+    OR (r_score = 5 AND fm_score = 1 ) 
+    THEN 'Potential '
+    WHEN (r_score = 4 AND fm_score = 1)
+    OR (r_score = 3 AND fm_score = 1)
+    OR (r_score = 2 AND fm_score = 3)
+    OR (r_score = 4 AND fm_score = 2)
+    OR (r_score = 3 AND fm_score = 2) 
+    OR(r_score = 1 AND fm_score = 5) 
+    OR(r_score = 1 AND fm_score = 4) 
+    THEN 'Need attention'
+    WHEN (r_score = 2 AND fm_score = 1 ) 
+    OR (r_score = 2 AND fm_score = 2) 
+    OR (r_score = 1 AND fm_score = 3) 
+    OR r_score = 1 AND fm_score = 2 
+    OR r_score = 1 AND fm_score = 1 
+    THEN 'Lost'
+END
+  AS rfm_segment
+FROM
+  score)
+SELECT
+  rfm_segment,
+  last_sale AS order_date,
+  F_M.user_id,
+  F_M.monetary,
+  recency,
+  F_M.frequency
+FROM
+  F_M
+JOIN
+  segments
+ON
+  F_M.user_id = segments.user_id
